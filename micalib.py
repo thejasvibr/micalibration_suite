@@ -54,6 +54,8 @@ Created on Wed Mar 20 17:04:14 2019
 """
 import warnings
 
+from sklearn.linear_model import LinearRegression
+
 import soundfile as sf
 import numpy as np 
 import scipy.signal as signal 
@@ -147,6 +149,16 @@ def align_mic_rec(mic_rec):
     
     The first sweep is used to find the playback latency. 
     This is the first 700 ms chunk with a 10ms chunk in the middle
+
+    Parameters:
+
+        mic_rec : 1 x nsamples np.array
+
+    Returns : 
+
+        pbk_delay : integer. Number of samples of delay. 
+
+        aligned_micrec : 1 x alignedsamples np.array. the time-aligned version of mic_rec
 
     '''
     fs =192000
@@ -392,32 +404,263 @@ def make_filter_response(comp_gain, tone_freqs, nyquist):
                              np.zeros(add_freqs_right.size)))
     return(filter_freqs, filter_gain)
 
+def calculate_referencemic_received_SPL(refmic_tones, refmic_signal_level={'dBSPL_re20muPa':94,
+                                                              'dBpe': -75,
+                                                              'dBrms': -78}, 
+                                                                refmic_dBgain = 70):
+    '''Calculates the received sound pressure levels of each tone of a reference
+    calibration microphone with flat frequency response and a measured recording
+    of a known SPL tone. Here the GRAS 1/4th inch mic is used, and its companion
+    calibrator tone at 94 dB SPL is the recorded sound of known sound pressure level. 
+    
+    TODO : allow calculate_referencemic_received_SPL to accept kwargs for the 
+           refmic_signal_level and refmic_dBgain
+    
+    Parameters:
+
+        refmic_tones : Nfreq x nsamples. Audio snippets w pure tones
+
+        refmic_signal_level : dictionary. 
+                Keys:
+                    'dBSPL_re20muPa' : float>0. sound pressure level.
+                                       Defaults to GRAS calibrator tone at 94 dB SPL 
+                    'dBpe' : float <0. peak level in calibration tone recording.
+                                       Defaults to -75 dB pe for the Fireface 802 + GRAS 1/4th inch combination
+                    'dBrms' : float<0. rms level in calibration tone recording. Defaults to -78
+                                       Defaults to -78 dB pe for the Fireface 802 + GRAS 1/4th inch combination
+
+        dBgain : integer. dB gain for all the recordings. Defaults to 70 dB because those were the settings I used.
+
+    Returns:
+        sound_pressure_levels: Ntones x 3 np.array with dB SPL re 20muPa.
+                               Column 0 has the playback frequency
+                               Column 1 has the dB peak equivalent  SPL
+                               Column 2 has the dB rms equivalent SPL
+
+    NOTE: ALL recordings are assumed to have the same gain. If this is *NOT* the case, 
+    please manually adjust the gains for each playback and then choose a sensible 
+    dBgain value. 
+   '''
+
+    calib_mic_clip = {}
+    calib_mic_clip['clip_dBpe'] = refmic_signal_level['dBSPL_re20muPa'] - refmic_signal_level['dBpe']
+    calib_mic_clip['clip_dBrms'] = refmic_signal_level['dBSPL_re20muPa'] - refmic_signal_level['dBrms']
+    pure_tone_levels = get_pure_tone_levels(refmic_tones)
+
+    pure_tone_SPL = np.zeros(pure_tone_levels.shape)
+    pure_tone_SPL[:,0] = pure_tone_levels[:,0]
+    pure_tone_SPL[:,1] = calib_mic_clip['clip_dBpe'] + pure_tone_levels[:,1] - refmic_dBgain
+    pure_tone_SPL[:,2] = calib_mic_clip['clip_dBrms'] + pure_tone_levels[:,2] - refmic_dBgain
+
+    return(pure_tone_SPL)
+    
+def calculate_clip_level(mic_tone_levels, received_SPL, comp_frequency_response,
+                             dBgain, **kwargs):
+    '''Calculates clip level of the recording system (mic X ADC device).
+    This is done with a regression of the known sound pressure levels(Y) and the 
+    recording system's registered levels (X in dB peak or dB rms). 
+    
+    If this regression is a good fit, then the clip level is found by extrapolating
+    the X to a value of 0. 
 
 
+    Parameters:
+
+        mic_tone_levels : Nfrequencies x 3 np.array.
+                          Column 0 : the frequency of playback in Hz
+                          Column 1 : the registered level in db peak
+                          Column 2 : the registered level in db rms
+
+        received_SPL : Nfrequencies x 1 np.array. The received sound pressure level 
+                       re 20 muPa. These values are obtained from a calibrated mic.
+
+        comp_frequency_response : Nfrequencies x 1 np.array. The required attenuation
+                      or gain to each playback frequency to achieve a flat frequency
+                      response. the values are in dB.
+
+        dBgain : integer. The gain in dB used while recording. 
+    
+    Keyword Arguments:
+
+        residual_threshold : integer. The acceptable range of the regression residuals
+                            in dB. eg. if the threshold is 0.5 dB and there are 
+                            residuals > 0.5 dB, then a warning is issued. Defaults
+                            to 1 dB, an arbitrary value set by me. 
+
+    Returns :
+
+        clip_level : Dictionary with 2 keys. The clip levels in dB SPL of the system. 
+                          'dB_peSPL' : sound pressure level in dB peak
+                          'dB_rmsSPL': sound pressure level in dB rms
+
+        SPL_regression : dictionary with 2 sklearn regression objects.
+                        Keys : 
+                            'regression_dBpe'
+                            'regression_dBrms'
+
+    '''
+    if 'residual_threshold' in kwargs.keys():
+        residual_threshold = kwargs['residual_threshold']
+    else:
+        residual_threshold = 1 
+
+    # compensate the received levels so the mic has a flat frequency response
+    comp_mic_tone_levels = mic_tone_levels.copy()
+    comp_mic_tone_levels[:,1] += comp_frequency_response 
+    comp_mic_tone_levels[:,2] += comp_frequency_response 
     
 
+    # compensate for the gain while recording:
+    comp_mic_tone_levels[:,1:] -= dBgain
 
+    # do regression of the received pressure level and the recorded levels
+    rec_dBpe = comp_mic_tone_levels[:,1].reshape(-1,1)
+    rec_dBrms = comp_mic_tone_levels[:,2].reshape(-1,1)
+    SPL = received_SPL.reshape(-1,1)
+
+    clip_level = {}
+    SPL_regressions = []
+    for key_name, rec_measure in zip(['dB_peSPL','dB_rmsSPL'],[rec_dBpe, rec_dBrms]):
+        cliplevel_reg = LinearRegression()
+        cliplevel_reg.fit(rec_measure, SPL)
+
+        # check if the residuals of the regression are low-ish. 
+        predicted = cliplevel_reg.predict(rec_measure)
+        residuals = predicted  - SPL
+        within_limit = np.all(residuals <= np.abs(residual_threshold))
+
+        if not within_limit:
+            percent_within = np.round( np.sum(np.abs(residuals)<=residual_threshold)/residuals.size, 2)
+            msg1 = 'Some residuals are beyond the threshold for the '+ key_name+' regression' +'\n'
+            msg2 = str(percent_within)+' of your data is within the '+str(residual_threshold)+'dB threshold. N=' + str(residuals.size)
+            warnings.warn(msg1+msg2)
+
+            
+            plt.figure()
+            plt.subplot(121)
+            plt.plot(SPL, residuals,'*')
+            plt.hlines(0, np.min(SPL), np.max(SPL))
+            plt.grid()
+            plt.xlabel('Received level, dB SPL re 20 muPa');plt.ylabel('residuals, dB')
+            plt.title('Regression diagnostic : sound pressure level vs residuals for '+key_name)  
+            plt.subplot(122)
+            plt.hist(residuals)
+        
+        clip_level[key_name] = int(np.round(cliplevel_reg.predict(np.array(0).reshape(1,1))))
+        SPL_regressions.append(cliplevel_reg)
+    return(clip_level, SPL_regressions)
+
+def calibrate_microphone(mic_recording, mic_gain, refmic_recording, **kwargs):
+    '''Calculates the clip level of the mic+recording system and outputs the compensatory frequency response.
+
+    Parameters:
+        mic_recording : path to the microphone recording. The mic recording of the pre-defined playback
+                        See generate_calibration_playback_sequence
+
+        mic_gain : float. dB gain used for the recording. 
+
+        refmic_recording : path to the reference mic recording. The recording the pre-defined playback, 
+                        with a *calibration* microphone. In this case, the default is taken as
+                        as the settings used for the1/4'' GRAS mic w the Fireface 802.
+
+    Keyword Arguments:
+        residual_threshold : float. The absolute range in dB within which the residuals
+                             should lie. See calculate_clip_level
+
+        refmic_signal_level : dictionary with entries pertaining to the calibration tone
+                              recording from the reference microphone.  
+                              See calculate_referencemic_received_SPL
+
+        refmic_dBgain : float. The gain used while recording the calibration tone 
+                        with the reference microphone. 
+                              
+
+    Returns:
+
+        clip_level : Dictionary with 2 entries.
+                     See calculate_clip_level
+
+        compensatory_frequency_response: Dictionary with 2 entries.
+
+            
+    '''
+    # get recorded tone levels and separate the tones themselves
+    refmic_tonelevels, refmic_tones = make_freq_vs_levels(refmic_recording)
+    mic_tonelevels, mic_tones = make_freq_vs_levels(mic_recording)
+
+    # generate the compensatory frequency response profile and the filter
+    comp_profile, comp_filter = calc_mic_frequency_response(mic_tonelevels, refmic_tonelevels)
+
+    # calculate the received SPL of the tones from the reference mic:
+    received_SPL = calculate_referencemic_received_SPL(refmic_tones)
+
+    # get the clip level of the mic+ADC system:
+    clip_level, cliplevel_regs = calculate_clip_level(mic_tonelevels, received_SPL[:,1],
+                                                      comp_profile[:,1], mic_gain, **kwargs)
+
+    compensatory_frequency_response = {'comp_profile':comp_profile,
+                                       'comp_filter':comp_filter}
+
+    return(clip_level, compensatory_frequency_response)
+
+def calculate_received_SPL(audio_snippet, dBgain, compensatory_filter, clip_level):
+    '''Calculates the received sound pressure level of an audio snippet
+    given the compensatory frequency response filter and the clip level of 
+    the mic+ADC system. 
+    
+    '''
+    # compensate for frequency response of microphone
+    comp_snippet = signal.convolve(audio_snippet, compensatory_filter,'same')
+    # account for the gain used while recording
+    dB_peak = dB(calc_peak(comp_snippet)) - dBgain
+    dB_rms = dB(calc_rms(comp_snippet)) - dBgain
+    # calculate received level based on clipping SPL of the mic+ADC system
+    rec_peSPL = clip_level['dB_peSPL'] + dB_peak
+    rec_rmsSPL = clip_level['dB_rmsSPL'] + dB_rms
+
+    return(rec_peSPL, rec_rmsSPL)
+
+def calc_sweep_params(rec_sweep):
+    b,a = signal.butter(2, 8000/96000.0, 'highpass')
+    hp_sweep = signal.filtfilt(b,a, rec_sweep)
+    peak_val = np.max(np.abs(hp_sweep))
+    rms_val = rms(hp_sweep)
+    return(peak_val, rms_val)
 
 if __name__ == '__main__':
     
     #path = 'H:\\fieldwork_2018_001\\mic_calibrations\\2018-07-16\\'
-    path = 'H:\\fieldwork_2018_001\\mic_calibrations\\2019-01-10\\myotis_CPN_mics\\SANKEN_12_1546\\'
+    gras_path = 'H:\\fieldwork_2018_001\\mic_calibrations\\2019-01-10\\myotis_CPN_mics\\SANKEN_11_1545\\'
+    gras_file = 'GRAS_gaindB_70_azimuth_angle_0_2019-01-11_11-42-59.wav'
 
+    mic_folder =  'H:\\fieldwork_2018_001\\mic_calibrations\\2019-01-10\\myotis_CPN_mics\\'+'SANKEN_11_1545\\'
+    mic_file = 'SANKEN_11_1545_gaindB_30_azimuth_angle_0_2019-01-11_11-29-23.wav'
     # load a SANKEN recording and get pure tone levels
-    sanken_tonelevels, sanken = make_freq_vs_levels(path+'SANKEN_12_1546_aindB_30_azimuth_angle_80_2019-01-11_10-05-51.wav')
-    gras_tonelevels, gras = make_freq_vs_levels(path+'GRAS_gaindB_70_azimuth_angle_0_2019-01-11_10-39-31.wav')
-    
+    sanken_tonelevels, sanken = make_freq_vs_levels(mic_folder+mic_file)
+    gras_tonelevels, gras = make_freq_vs_levels(gras_path+gras_file)
+
     ctone_levels, fc = calc_mic_frequency_response(sanken_tonelevels, gras_tonelevels)
     
     comp_sanken_tonelevels = sanken_tonelevels.copy()
     comp_sanken_tonelevels[:,1] += ctone_levels[:,1]
     comp_sanken_tonelevels[:,2] += ctone_levels[:,1]
+
+    tone_SPL = calculate_referencemic_received_SPL(gras)
+
+    clip_levels, clip_regs = calculate_clip_level(sanken_tonelevels, tone_SPL[:,1], ctone_levels[:,1], 30,
+    residual_threshold=1)    
+
+    a, b = calibrate_microphone(mic_folder+mic_file, 30, gras_path+gras_file)
+    print(a)
     
-    
+    rec, fs = sf.read(mic_folder+mic_file)
+    _, aligned_rec = align_mic_rec(rec)
+    sweeps = get_sweeps(aligned_rec)
+    # take out only the relevant sections of the sweep.
+    only_sweeps = sweeps[:,57600:57600+1921]
 
-
-
-
+    # get received level of the sweeps:
+    rec_peSPL, rec_rmsSPL = calculate_received_SPL(only_sweeps[4,:],30, b['comp_filter'], a);    print(rec_peSPL, rec_rmsSPL)
 
 
 
